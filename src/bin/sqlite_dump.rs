@@ -6,6 +6,7 @@
 //! for consumption by the Hermes Decompiler UI.
 
 use hermes_rs::hermes_file::HermesFile;
+use hermes_rs::array_parser::ArrayTypes;
 use rusqlite::{Connection, Result as SqlResult};
 use std::{env, fs::File, io};
 
@@ -56,17 +57,27 @@ fn main() -> SqlResult<()> {
     // Insert functions and instructions
     insert_functions_and_instructions(&conn, &mut hermes_file)?;
 
+    // Insert arrays
+    insert_arrays(&conn, &mut hermes_file)?;
+
+    // Insert objects
+    insert_objects(&conn, &mut hermes_file)?;
+
     println!("Database created successfully!");
 
     // Print summary
     let func_count: i64 = conn.query_row("SELECT COUNT(*) FROM functions", [], |row| row.get(0))?;
     let instr_count: i64 = conn.query_row("SELECT COUNT(*) FROM instructions", [], |row| row.get(0))?;
     let string_count: i64 = conn.query_row("SELECT COUNT(*) FROM strings", [], |row| row.get(0))?;
+    let array_count: i64 = conn.query_row("SELECT COUNT(*) FROM arrays", [], |row| row.get(0))?;
+    let object_count: i64 = conn.query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))?;
 
     println!("Summary:");
     println!("  Functions: {}", func_count);
     println!("  Instructions: {}", instr_count);
     println!("  Strings: {}", string_count);
+    println!("  Arrays: {}", array_count);
+    println!("  Objects: {}", object_count);
 
     Ok(())
 }
@@ -76,7 +87,7 @@ fn create_schema(conn: &Connection) -> SqlResult<()> {
         r#"
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
 
-        CREATE TABLE strings (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE strings (id INTEGER PRIMARY KEY, value TEXT, offset INTEGER, length INTEGER, is_utf16 INTEGER);
 
         CREATE TABLE functions (
             id INTEGER PRIMARY KEY,
@@ -99,6 +110,21 @@ fn create_schema(conn: &Connection) -> SqlResult<()> {
             operands_json TEXT,
             formatted_text TEXT,
             FOREIGN KEY (func_id) REFERENCES functions(id)
+        );
+
+        CREATE TABLE arrays (
+            id INTEGER PRIMARY KEY,
+            offset INTEGER,
+            element_count INTEGER,
+            elements_json TEXT
+        );
+
+        CREATE TABLE objects (
+            id INTEGER PRIMARY KEY,
+            offset INTEGER,
+            key_count INTEGER,
+            keys_json TEXT,
+            values_json TEXT
         );
 
         CREATE INDEX idx_instr_func ON instructions(func_id);
@@ -128,10 +154,34 @@ fn insert_strings<R: io::Read + io::BufRead + io::Seek>(
     hermes_file: &HermesFile<R>,
 ) -> SqlResult<()> {
     let strings = hermes_file.get_strings_by_kind();
-    let mut stmt = conn.prepare("INSERT INTO strings (id, value) VALUES (?, ?)")?;
+    let mut stmt = conn.prepare("INSERT INTO strings (id, value, offset, length, is_utf16) VALUES (?, ?, ?, ?, ?)")?;
 
+    // Access string_storage directly for offset/length metadata
     for (idx, s) in strings.iter().enumerate() {
-        stmt.execute(rusqlite::params![idx as i64, &s.string])?;
+        let (real_offset, real_length, is_utf16) = if idx < hermes_file.string_storage.len() {
+            let entry = &hermes_file.string_storage[idx];
+            
+            // Handle overflow strings (length = 255 means lookup in overflow table)
+            if entry.length == 255 {
+                if let Some(overflow_entry) = hermes_file.overflow_string_storage.get(entry.offset as usize) {
+                    (overflow_entry.offset as i64, overflow_entry.length as i64, entry.is_utf_16)
+                } else {
+                    (entry.offset as i64, entry.length as i64, entry.is_utf_16)
+                }
+            } else {
+                (entry.offset as i64, entry.length as i64, entry.is_utf_16)
+            }
+        } else {
+            (0i64, 0i64, false)
+        };
+
+        stmt.execute(rusqlite::params![
+            idx as i64,
+            &s.string,
+            real_offset,
+            real_length,
+            if is_utf16 { 1 } else { 0 }
+        ])?;
     }
 
     Ok(())
@@ -239,3 +289,120 @@ fn extract_opcode_name(debug_str: &str) -> String {
     }
     "Unknown".to_string()
 }
+
+fn insert_arrays<R: io::Read + io::BufRead + io::Seek>(
+    conn: &Connection,
+    hermes_file: &mut HermesFile<R>,
+) -> SqlResult<()> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO arrays (id, offset, element_count, elements_json) VALUES (?, ?, ?, ?)"
+    )?;
+
+    let mut array_id = 0;
+    let mut next_idx = 0;
+    
+    while next_idx < hermes_file.array_buffer_storage.len() {
+        let (new_idx, array_vals) = hermes_file.get_array_buffer(next_idx, 0);
+        
+        if new_idx <= next_idx {
+            break; // Prevent infinite loop
+        }
+
+        // Convert array values to JSON
+        let elements_json = array_values_to_json(hermes_file, &array_vals);
+        
+        stmt.execute(rusqlite::params![
+            array_id as i64,
+            next_idx as i64,
+            array_vals.len() as i64,
+            elements_json
+        ])?;
+
+        array_id += 1;
+        next_idx = new_idx;
+    }
+
+    println!("  Inserted {} arrays", array_id);
+    Ok(())
+}
+
+fn insert_objects<R: io::Read + io::BufRead + io::Seek>(
+    conn: &Connection,
+    hermes_file: &mut HermesFile<R>,
+) -> SqlResult<()> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO objects (id, offset, key_count, keys_json, values_json) VALUES (?, ?, ?, ?, ?)"
+    )?;
+
+    let mut object_id = 0;
+    let mut key_idx = 0;
+    let mut val_idx = 0;
+    
+    // Process keys and values in parallel
+    while key_idx < hermes_file.object_key_buffer.len() && val_idx < hermes_file.object_val_buffer.len() {
+        let (new_key_idx, key_vals) = hermes_file.get_object_key_buffer(key_idx, 0);
+        let (new_val_idx, val_vals) = hermes_file.get_object_val_buffer(val_idx, 0);
+        
+        if new_key_idx <= key_idx || new_val_idx <= val_idx {
+            break; // Prevent infinite loop
+        }
+
+        // Convert to JSON
+        let keys_json = array_values_to_json(hermes_file, &key_vals);
+        let values_json = array_values_to_json(hermes_file, &val_vals);
+        
+        stmt.execute(rusqlite::params![
+            object_id as i64,
+            key_idx as i64,
+            key_vals.len() as i64,
+            keys_json,
+            values_json
+        ])?;
+
+        object_id += 1;
+        key_idx = new_key_idx;
+        val_idx = new_val_idx;
+    }
+
+    println!("  Inserted {} objects", object_id);
+    Ok(())
+}
+
+fn array_values_to_json<R: io::Read + io::BufRead + io::Seek>(
+    hermes_file: &HermesFile<R>,
+    vals: &[ArrayTypes],
+) -> String {
+    let json_vals: Vec<String> = vals.iter().map(|v| {
+        match v {
+            ArrayTypes::NullValue {} => "null".to_string(),
+            ArrayTypes::TrueValue { .. } => "true".to_string(),
+            ArrayTypes::FalseValue { .. } => "false".to_string(),
+            ArrayTypes::NumberValue { value } => {
+                // Convert u64 bits to f64
+                let f = f64::from_bits(*value);
+                if f.is_nan() || f.is_infinite() {
+                    format!("\"{}\"", f)
+                } else {
+                    format!("{}", f)
+                }
+            },
+            ArrayTypes::IntegerValue { value } => format!("{}", value),
+            ArrayTypes::LongStringValue { value } => {
+                let s = hermes_file.get_string_from_storage_by_index(*value as usize);
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"))
+            },
+            ArrayTypes::ShortStringValue { value } => {
+                let s = hermes_file.get_string_from_storage_by_index(*value as usize);
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"))
+            },
+            ArrayTypes::ByteStringValue { value } => {
+                let s = hermes_file.get_string_from_storage_by_index(*value as usize);
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t"))
+            },
+            ArrayTypes::EmptyValueSized { value } => format!("\"empty:{}\"", value),
+        }
+    }).collect();
+    
+    format!("[{}]", json_vals.join(","))
+}
+
