@@ -9,11 +9,9 @@ input_data
 obsidian-out
 **/obsidian-export.rs
 **/gen.rs
-docs
 TODO.md
 *.hexpat
 !helpers/*.hexpat
-*.txt
 
 # mini kitchen sink apps for testing - no need to push this publicly
 wasm
@@ -23,4 +21,8 @@ string_merging
 examples/string_merge*
 examples/merge*
 src/bin/decompile
-decompiler
+
+# Generated files
+tmp-files/
+*.db
+*_bytecode.txt

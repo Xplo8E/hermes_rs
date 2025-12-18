@@ -28,10 +28,20 @@ specta = { version = "1.0.5", features = [
     "typescript",
 ], optional = true }
 specta-util = { version = "0.0.7", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1.0"
 
 [profile.release]
 strip = true
 
 [[bin]]
 name = "decompile"
-path = "src/bin/decompile/decompile.rs"
+path = "src/bin/bytecode.rs"
+
+[[bin]]
+name = "sqlite_dump"
+path = "src/bin/sqlite_dump.rs"
+
+[[bin]]
+name = "sqlite_from_text"
+path = "src/bin/sqlite_from_text.rs"
